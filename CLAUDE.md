@@ -13,7 +13,8 @@
 3. テストを書きながら実装し、`mise run check` を通す。
 4. `/code-review xhigh --fix` でレビューと修正を行う。
 5. コミットして `gh pr create` で PR を出す。
-6. 本文の PR をマージしてから、章末の練習問題を別ブランチ `chNN-exercises` で扱う。後回しにした課題は GitHub Issues に登録する。
+6. 本文の PR をマージしてから、章末の練習問題を別ブランチ `chNN-exercises` で扱う (問題が多い章は `chNN-exercises-http` のようにテーマごとに分ける)。後回しにした課題は GitHub Issues に登録する。
+7. PR をマージしたら、対応する Issue のチェック項目を更新し、すべて終わった Issue は閉じる。
 
 ## GitHub Issues の扱い
 
