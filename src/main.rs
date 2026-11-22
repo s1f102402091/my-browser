@@ -2,6 +2,7 @@
 //!
 //! 「Web Browser Engineering」の章を進めるごとに機能を追加していく。
 
+mod http;
 mod tls;
 mod url;
 

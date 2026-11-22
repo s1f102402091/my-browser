@@ -1,12 +1,19 @@
 //! URL の解析と、HTTP / HTTPS によるページの取得 (本の `URL` クラスに相当)。
+//!
+//! HTTP のメッセージの読み書きは `http` モジュール、暗号化は `tls` モジュールに任せ、
+//! ここではどこへ接続するか (URL の解析、リダイレクトの追従) を受け持つ。
 
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io;
 use std::net::TcpStream;
 
+use crate::http::{self, HttpError};
 use crate::tls::{self, TlsError};
+
+/// たどるリダイレクトの回数の上限 (Chrome や Firefox と同じ)。
+const MAX_REDIRECTS: usize = 20;
 
 /// 対応している URL スキーム。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +23,14 @@ pub enum Scheme {
 }
 
 impl Scheme {
+    /// URL に書くときの名前。
+    fn name(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+
     /// ポートが省略されたときに使うポート番号。
     fn default_port(self) -> u16 {
         match self {
@@ -41,12 +56,8 @@ pub struct Url {
 impl Url {
     /// `scheme://host[:port][/path][?query][#fragment]` 形式の文字列を解析する。
     pub fn parse(url: &str) -> Result<Self, ParseError> {
-        // 前後の空白は取り除く。途中の制御文字 (改行など) や空白は、
-        // そのままリクエストに埋め込むとリクエストを壊すので受け付けない
         let url = url.trim();
-        if let Some(c) = url.chars().find(|c| c.is_ascii_control() || *c == ' ') {
-            return Err(ParseError::InvalidCharacter(c));
-        }
+        check_characters(url)?;
 
         let (scheme, rest) = url.split_once("://").ok_or(ParseError::MissingScheme)?;
         // スキームは大文字・小文字を区別しない (`HTTP://` も可)
@@ -61,14 +72,6 @@ impl Url {
         // ホストは最初の `/`・`?`・`#` の手前まで
         let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let (host, path) = rest.split_at(host_end);
-        // フラグメント (`#` 以降) はページ内の位置を表すもので、サーバーには送らない
-        let path = path.split_once('#').map_or(path, |(path, _fragment)| path);
-        // パスがなければ `/` とみなす (`?q=1` だけなら `/?q=1`)
-        let path = if path.starts_with('/') {
-            path.to_owned()
-        } else {
-            format!("/{path}")
-        };
 
         let (host, port) = match host.split_once(':') {
             // `example.org:` のようにポート番号が空なら既定のポートを使う
@@ -84,36 +87,119 @@ impl Url {
             scheme,
             host: host.to_owned(),
             port,
-            path,
+            path: request_path(path),
         })
     }
 
+    /// `self` を基準に、リダイレクト先などの URL を解決する
+    /// (本の第7章で作る `URL.resolve` のうち、練習問題 1-7 に必要な分)。
+    ///
+    /// 対応しているのは次の 3 つの形。`next.html` のような相対パスは第7章で対応する。
+    /// - `https://example.org/a`: 完全な URL
+    /// - `//example.org/a`: スキームだけを引き継ぐ
+    /// - `/a`: スキーム・ホスト・ポートを引き継ぐ
+    pub fn resolve(&self, url: &str) -> Result<Self, ParseError> {
+        let url = url.trim();
+        if let Some(rest) = url.strip_prefix("//") {
+            return Self::parse(&format!("{}://{rest}", self.scheme.name()));
+        }
+        if url.starts_with('/') {
+            check_characters(url)?;
+            return Ok(Self {
+                scheme: self.scheme,
+                host: self.host.clone(),
+                port: self.port,
+                path: request_path(url),
+            });
+        }
+        if has_scheme(url) {
+            return Self::parse(url);
+        }
+        Err(ParseError::RelativeUrl(url.to_owned()))
+    }
+
     /// サーバーに GET リクエストを送り、レスポンスの本文を返す。
+    /// リダイレクトのレスポンスなら、`Location` ヘッダの URL をたどる (練習問題 1-7)。
     pub fn request(&self) -> Result<String, RequestError> {
-        let stream = TcpStream::connect((self.host.as_str(), self.port))?;
-        match self.scheme {
-            Scheme::Http => self.exchange(stream),
-            Scheme::Https => self.exchange(tls::connect(&self.host, stream)?),
+        // 最初は `self` を借用し、リダイレクトしたときだけ新しい URL を持つ
+        let mut url = Cow::Borrowed(self);
+        let mut redirects = 0;
+        loop {
+            let response = url.fetch()?;
+            let Some(location) = redirect_location(&response) else {
+                return Ok(decode_text(response.body));
+            };
+            // 上限を超えたら、移動先の URL を解釈する前に打ち切る
+            if redirects == MAX_REDIRECTS {
+                return Err(RequestError::TooManyRedirects);
+            }
+            redirects += 1;
+            let next = url
+                .resolve(location)
+                .map_err(|source| RequestError::InvalidRedirect {
+                    location: location.to_owned(),
+                    source,
+                })?;
+            url = Cow::Owned(next);
         }
     }
 
-    /// 接続済みのストリームでリクエストを送り、レスポンスを読む。
+    /// 1 回だけリクエストを送り、レスポンスを受け取る (リダイレクトはたどらない)。
     ///
-    /// HTTP と HTTPS の違いは「どんなストリームか」だけなので、ここでは区別しない。
-    fn exchange(&self, mut stream: impl Read + Write) -> Result<String, RequestError> {
-        // 既定以外のポートは Host ヘッダにも含める (RFC 9110 7.2 節)
-        let request = if self.port == self.scheme.default_port() {
-            format!("GET {} HTTP/1.0\r\nHost: {}\r\n\r\n", self.path, self.host)
-        } else {
-            format!(
-                "GET {} HTTP/1.0\r\nHost: {}:{}\r\n\r\n",
-                self.path, self.host, self.port
-            )
+    /// HTTP と HTTPS の違いは「どんなストリームの上で読み書きするか」だけ。
+    fn fetch(&self) -> Result<http::Response, RequestError> {
+        let stream =
+            TcpStream::connect((self.host.as_str(), self.port)).map_err(RequestError::Connect)?;
+        let host = self.host_header();
+        let response = match self.scheme {
+            Scheme::Http => http::get(stream, &host, &self.path)?,
+            Scheme::Https => http::get(tls::connect(&self.host, stream)?, &host, &self.path)?,
         };
-        stream.write_all(request.as_bytes())?;
-        stream.flush()?;
-        read_response(BufReader::new(stream))
+        Ok(response)
     }
+
+    /// Host ヘッダの値。既定以外のポートはポート番号も含める (RFC 9110 7.2 節)。
+    fn host_header(&self) -> Cow<'_, str> {
+        if self.port == self.scheme.default_port() {
+            Cow::Borrowed(&self.host)
+        } else {
+            Cow::Owned(format!("{}:{}", self.host, self.port))
+        }
+    }
+}
+
+/// 制御文字 (改行など) や空白を含んでいないか確かめる。
+/// そのままリクエストに埋め込むと、リクエストを壊してしまうため。
+fn check_characters(url: &str) -> Result<(), ParseError> {
+    match url.chars().find(|c| c.is_ascii_control() || *c == ' ') {
+        Some(c) => Err(ParseError::InvalidCharacter(c)),
+        None => Ok(()),
+    }
+}
+
+/// パス・クエリ・フラグメントの部分から、リクエストに使うパスを作る。
+///
+/// フラグメント (`#` 以降) はページ内の位置を表すもので、サーバーには送らない。
+/// パスがなければ `/` とみなす (`?q=1` だけなら `/?q=1`)。
+/// リクエスト行には ASCII しか書けないので、ASCII 以外の文字は UTF-8 のバイトごとに
+/// `%XX` へ変換する (例: `日` → `%E6%97%A5`。RFC 3986 2.1 節)。
+fn request_path(path: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let path = path.split_once('#').map_or(path, |(path, _fragment)| path);
+    let mut encoded = String::with_capacity(path.len() + 1);
+    if !path.starts_with('/') {
+        encoded.push('/');
+    }
+    for &b in path.as_bytes() {
+        if b.is_ascii() {
+            encoded.push(char::from(b));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(b >> 4)]));
+            encoded.push(char::from(HEX[usize::from(b & 0x0F)]));
+        }
+    }
+    encoded
 }
 
 /// ポート番号を解析する。
@@ -126,99 +212,40 @@ fn parse_port(port: &str) -> Result<u16, ParseError> {
     port.parse().map_err(|_| invalid())
 }
 
-/// ステータス行とヘッダの合計サイズの上限。
-/// 改行を送ってこないサーバーなどに、際限なくメモリを使わせないため。
-const MAX_HEADER_BYTES: u64 = 64 * 1024;
-
-/// レスポンスを読み、ステータス行とヘッダを確かめてから本文を返す。
-fn read_response(mut reader: impl BufRead) -> Result<String, RequestError> {
-    // 各行の読み込みで同じバッファを使い回す
-    let mut line = Vec::new();
-    let mut header_budget = MAX_HEADER_BYTES;
-
-    read_line(&mut reader, &mut line, &mut header_budget)?;
-    check_status_line(&String::from_utf8_lossy(&line))?;
-
-    // 行バッファを使い回すので、ヘッダの名前と値は借用ではなく String として持つ
-    let mut headers = HashMap::new();
-    loop {
-        read_line(&mut reader, &mut line, &mut header_budget)?;
-        let header_line = String::from_utf8_lossy(&line);
-        if header_line.is_empty() {
-            break;
-        }
-        let (name, value) = header_line.split_once(':').ok_or_else(|| {
-            RequestError::MalformedResponse(format!("ヘッダ行に `:` がない: {header_line}"))
-        })?;
-        // ヘッダ名は大文字・小文字を区別しない (本の `casefold()` に相当)
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
-    }
-
-    // 圧縮・チャンク転送にはまだ対応していない
-    for name in ["transfer-encoding", "content-encoding"] {
-        if let Some(value) = headers.get(name) {
-            return Err(RequestError::UnsupportedEncoding {
-                header: name,
-                value: value.clone(),
-            });
-        }
-    }
-
-    let mut body = Vec::new();
-    reader.read_to_end(&mut body)?;
-    // 正しい UTF-8 ならバッファをそのまま String にする (コピーしない)。
-    // 不正なバイト列があれば U+FFFD に置き換えて表示を続ける
-    Ok(String::from_utf8(body)
-        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned()))
+/// `scheme:` で始まる (相対 URL ではない) か (スキームの形式は RFC 3986 3.1 節)。
+fn has_scheme(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(scheme, _)| {
+        let mut chars = scheme.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
 }
 
-/// 1 行を `line` に読み込み、末尾の改行 (`\r\n` または `\n`) を取り除く。
+/// リダイレクトのレスポンスなら、`Location` ヘッダの値を返す。
 ///
-/// 読んだバイト数だけ `budget` を減らす。改行の前に接続が切れたとき、
-/// または `budget` を使い切ったときはエラーにする。
-fn read_line(
-    reader: &mut impl BufRead,
-    line: &mut Vec<u8>,
-    budget: &mut u64,
-) -> Result<(), RequestError> {
-    line.clear();
-    let read = reader.by_ref().take(*budget).read_until(b'\n', line)?;
-    *budget -= read as u64;
-    if line.pop() != Some(b'\n') {
-        let reason = if *budget == 0 {
-            format!("ヘッダが大きすぎる (上限 {} KiB)", MAX_HEADER_BYTES / 1024)
-        } else {
-            "ヘッダの途中で接続が切れた".to_owned()
-        };
-        return Err(RequestError::MalformedResponse(reason));
-    }
-    if line.ends_with(b"\r") {
-        line.pop();
-    }
-    Ok(())
-}
-
-/// ステータス行 (例: `HTTP/1.0 200 OK`) が HTTP の形式になっているか確かめる。
-///
-/// 本では `version, status, explanation` に分けるが、第1章ではどれも使わない。
-/// リダイレクト (練習問題 1-7) でステータスコードが必要になったら値を返すようにする。
-fn check_status_line(line: &str) -> Result<(), RequestError> {
-    let mut parts = line.splitn(3, ' ');
-    let version = parts.next().unwrap_or_default();
-    let status = parts.next().unwrap_or_default();
-    let is_valid = version.starts_with("HTTP/")
-        && status.len() == 3
-        && status.bytes().all(|b| b.is_ascii_digit());
-    if is_valid {
-        Ok(())
+/// 300 (Multiple Choices) と 304 (Not Modified) は移動先を示すものではないので含めない。
+/// `Location` がなければ、リダイレクトではなく普通のページとして表示する。
+fn redirect_location(response: &http::Response) -> Option<&str> {
+    if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+        response.headers.get("location")
     } else {
-        Err(RequestError::MalformedResponse(format!(
-            "ステータス行が不正: {line}"
-        )))
+        None
     }
+}
+
+/// 本文のバイト列を文字列にする。
+///
+/// 正しい UTF-8 ならバッファをそのまま String にする (コピーしない)。
+/// 不正なバイト列があれば U+FFFD に置き換えて表示を続ける (文字コードの判定は Issue #2)。
+fn decode_text(body: Vec<u8>) -> String {
+    String::from_utf8(body)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
 /// URL の解析に失敗した理由。
+///
+/// エラーは解析した文字列より長く使われる (呼び出し元へ返して表示する) ので、
+/// 問題の部分は借用せず `String` で持つ。
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
     /// 制御文字や空白など、URL に使えない文字を含む。
@@ -231,6 +258,8 @@ pub enum ParseError {
     InvalidPort(String),
     /// ホスト名が空。
     EmptyHost,
+    /// まだ解決できない形の相対 URL。
+    RelativeUrl(String),
 }
 
 impl fmt::Display for ParseError {
@@ -243,6 +272,9 @@ impl fmt::Display for ParseError {
             }
             Self::InvalidPort(port) => write!(f, "ポート番号が不正です: {port}"),
             Self::EmptyHost => write!(f, "ホスト名が空です"),
+            Self::RelativeUrl(url) => {
+                write!(f, "この形の相対 URL にはまだ対応していません: {url}")
+            }
         }
     }
 }
@@ -250,28 +282,38 @@ impl fmt::Display for ParseError {
 impl Error for ParseError {}
 
 /// ページの取得に失敗した理由。
+///
+/// リダイレクト先の URL は、それを含んでいたレスポンスを捨てたあとも表示に使うので
+/// `String` で持つ。
 #[derive(Debug)]
 pub enum RequestError {
-    /// 接続・送受信の失敗。
-    Io(io::Error),
+    /// サーバーに接続できない (名前解決の失敗を含む)。
+    Connect(io::Error),
     /// TLS の接続の失敗。
     Tls(TlsError),
-    /// HTTP のレスポンスとして解釈できない。
-    MalformedResponse(String),
-    /// まだ対応していない転送方式・圧縮方式。
-    UnsupportedEncoding { header: &'static str, value: String },
+    /// HTTP の送受信の失敗。
+    Http(HttpError),
+    /// リダイレクト先の URL を解釈できない。
+    InvalidRedirect {
+        location: String,
+        source: ParseError,
+    },
+    /// リダイレクトが上限の回数を超えた (ループしている可能性が高い)。
+    TooManyRedirects,
 }
 
 impl fmt::Display for RequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(_) => write!(f, "サーバーとの通信に失敗しました"),
+            Self::Connect(_) => write!(f, "サーバーに接続できませんでした"),
             Self::Tls(_) => write!(f, "TLS の接続に失敗しました"),
-            Self::MalformedResponse(reason) => {
-                write!(f, "不正なレスポンスです ({reason})")
+            // HTTP の失敗はそれ自体が説明になっているので、そのまま見せる
+            Self::Http(err) => err.fmt(f),
+            Self::InvalidRedirect { location, .. } => {
+                write!(f, "リダイレクト先の URL が不正です: {location}")
             }
-            Self::UnsupportedEncoding { header, value } => {
-                write!(f, "未対応のエンコーディングです ({header}: {value})")
+            Self::TooManyRedirects => {
+                write!(f, "リダイレクトが多すぎます (上限 {MAX_REDIRECTS} 回)")
             }
         }
     }
@@ -280,16 +322,12 @@ impl fmt::Display for RequestError {
 impl Error for RequestError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io(err) => Some(err),
+            Self::Connect(err) => Some(err),
             Self::Tls(err) => Some(err),
-            Self::MalformedResponse(_) | Self::UnsupportedEncoding { .. } => None,
+            Self::Http(err) => err.source(),
+            Self::InvalidRedirect { source, .. } => Some(source),
+            Self::TooManyRedirects => None,
         }
-    }
-}
-
-impl From<io::Error> for RequestError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
     }
 }
 
@@ -299,9 +337,16 @@ impl From<TlsError> for RequestError {
     }
 }
 
+impl From<HttpError> for RequestError {
+    fn from(err: HttpError) -> Self {
+        Self::Http(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::thread;
 
@@ -383,6 +428,19 @@ mod tests {
     }
 
     #[test]
+    fn percent_encodes_non_ascii_path() {
+        assert_eq!(
+            Url::parse("https://ja.wikipedia.org/wiki/日本?q=あ#節"),
+            Ok(url(
+                Scheme::Https,
+                "ja.wikipedia.org",
+                443,
+                "/wiki/%E6%97%A5%E6%9C%AC?q=%E3%81%82"
+            ))
+        );
+    }
+
+    #[test]
     fn trims_surrounding_whitespace() {
         assert_eq!(
             Url::parse("  http://example.org/\n"),
@@ -425,152 +483,183 @@ mod tests {
     }
 
     #[test]
-    fn reads_body_after_headers() {
-        let response = b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<p>hi</p>";
-        assert_eq!(read_response(&response[..]).unwrap(), "<p>hi</p>");
+    fn resolves_absolute_url() {
+        let base = url(Scheme::Https, "example.org", 8443, "/a");
+        assert_eq!(
+            base.resolve("http://example.com/b"),
+            Ok(url(Scheme::Http, "example.com", 80, "/b"))
+        );
     }
 
     #[test]
-    fn accepts_bare_lf_line_endings() {
-        let response = b"HTTP/1.1 404 Not Found\nServer: test\n\nnot found";
-        assert_eq!(read_response(&response[..]).unwrap(), "not found");
+    fn resolves_scheme_relative_url() {
+        let base = url(Scheme::Https, "example.org", 8443, "/a");
+        assert_eq!(
+            base.resolve("//example.com/b"),
+            Ok(url(Scheme::Https, "example.com", 443, "/b"))
+        );
+    }
+
+    #[test]
+    fn resolves_path_absolute_url() {
+        let base = url(Scheme::Https, "example.org", 8443, "/a");
+        assert_eq!(
+            base.resolve("/b?c=d#e"),
+            Ok(url(Scheme::Https, "example.org", 8443, "/b?c=d"))
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_redirect_targets() {
+        let base = url(Scheme::Http, "example.org", 80, "/a/b");
+        assert_eq!(
+            base.resolve("next.html"),
+            Err(ParseError::RelativeUrl("next.html".to_owned()))
+        );
+        assert_eq!(
+            base.resolve("/a\r\nX-Injected: 1"),
+            Err(ParseError::InvalidCharacter('\r'))
+        );
+        assert_eq!(
+            base.resolve("ftp://example.org/"),
+            Err(ParseError::UnsupportedScheme("ftp".to_owned()))
+        );
+    }
+
+    #[test]
+    fn host_header_omits_default_port() {
+        assert_eq!(
+            url(Scheme::Https, "example.org", 443, "/").host_header(),
+            "example.org"
+        );
+        assert_eq!(
+            url(Scheme::Http, "example.org", 8080, "/").host_header(),
+            "example.org:8080"
+        );
+    }
+
+    #[test]
+    fn shows_http_errors_as_is() {
+        let err = RequestError::from(HttpError::MalformedResponse("x".to_owned()));
+        assert_eq!(err.to_string(), "不正なレスポンスです (x)");
     }
 
     #[test]
     fn replaces_invalid_utf8_in_body() {
-        let response = b"HTTP/1.0 200 OK\r\n\r\na\xffb";
-        assert_eq!(read_response(&response[..]).unwrap(), "a\u{FFFD}b");
+        assert_eq!(decode_text(b"a\xffb".to_vec()), "a\u{FFFD}b");
     }
 
-    #[test]
-    fn rejects_encoded_responses_regardless_of_header_case() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Encoding:  gzip \r\n\r\n";
-        assert!(matches!(
-            read_response(&response[..]),
-            Err(RequestError::UnsupportedEncoding { header: "content-encoding", value })
-                if value == "gzip"
-        ));
-
-        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert!(matches!(
-            read_response(&response[..]),
-            Err(RequestError::UnsupportedEncoding {
-                header: "transfer-encoding",
-                ..
-            })
-        ));
-
-        // ヘッダ名と `:` の間に空白があっても見逃さない
-        let response = b"HTTP/1.1 200 OK\r\nContent-Encoding : gzip\r\n\r\n";
-        assert!(matches!(
-            read_response(&response[..]),
-            Err(RequestError::UnsupportedEncoding {
-                header: "content-encoding",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn rejects_malformed_responses() {
-        let cases: [&[u8]; 5] = [
-            b"",                                    // 何も返ってこない
-            b"hello\r\n\r\n",                       // HTTP ではない
-            b"HTTP/1.0 200 OK\r\nno-colon\r\n\r\n", // `:` のないヘッダ
-            b"HTTP/1.0 200 OK\r\nServer: test\r\n", // 空行の前に切れた
-            b"HTTP/1.0 200 OK\r\nServer: test",     // 改行の前に切れた
-        ];
-        for response in cases {
-            assert!(
-                matches!(
-                    read_response(response),
-                    Err(RequestError::MalformedResponse(_))
-                ),
-                "{:?}",
-                String::from_utf8_lossy(response)
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_oversized_headers() {
-        let mut response = b"HTTP/1.0 200 OK\r\nX-Long: ".to_vec();
-        let header_limit = usize::try_from(MAX_HEADER_BYTES).unwrap();
-        response.resize(header_limit + 1, b'a');
-        response.extend_from_slice(b"\r\n\r\nbody");
-        assert!(matches!(
-            read_response(&response[..]),
-            Err(RequestError::MalformedResponse(reason)) if reason.contains("大きすぎる")
-        ));
-    }
-
-    /// テスト用の HTTP サーバーを 1 回だけ応答する形で立てる。
-    /// 戻り値はポート番号と、受け取ったリクエストを返すスレッド。
-    fn serve_once(response: &'static [u8]) -> (u16, thread::JoinHandle<String>) {
+    /// テスト用の HTTP サーバーを立て、接続ごとに `responses` を先頭から 1 つずつ返す。
+    ///
+    /// `responses` にはポート番号が渡る (リダイレクト先の URL を作るため)。
+    /// 戻り値はポート番号と、受け取ったリクエストを順に返すスレッド。
+    fn serve(responses: impl FnOnce(u16) -> Vec<String>) -> (u16, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let responses = responses(port);
         let handle = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut request = String::new();
-            while !request.ends_with("\r\n\r\n") {
-                if reader.read_line(&mut request).unwrap() == 0 {
-                    break;
-                }
-            }
-            reader.get_mut().write_all(response).unwrap();
-            request
+            responses
+                .iter()
+                .map(|response| {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut request = String::new();
+                    while !request.ends_with("\r\n\r\n") {
+                        if reader.read_line(&mut request).unwrap() == 0 {
+                            break;
+                        }
+                    }
+                    reader.get_mut().write_all(response.as_bytes()).unwrap();
+                    request
+                })
+                .collect()
         });
         (port, handle)
     }
 
     #[test]
     fn sends_get_request_and_returns_body() {
-        let (port, server) = serve_once(b"HTTP/1.0 200 OK\r\n\r\nHello");
+        let (port, server) = serve(|_| vec!["HTTP/1.1 200 OK\r\n\r\nHello".to_owned()]);
         let url = Url::parse(&format!("http://127.0.0.1:{port}/index.html")).unwrap();
 
         assert_eq!(url.request().unwrap(), "Hello");
         // 既定以外のポートなので Host ヘッダにもポート番号が付く
         assert_eq!(
             server.join().unwrap(),
-            format!("GET /index.html HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+            [format!(
+                "GET /index.html HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{port}\r\n\
+                 Connection: close\r\n\
+                 User-Agent: my-browser/{}\r\n\
+                 \r\n",
+                env!("CARGO_PKG_VERSION")
+            )]
         );
-    }
-
-    /// 書き込まれた内容を記録し、決まったレスポンスを返すテスト用のストリーム。
-    struct MockStream {
-        response: io::Cursor<&'static [u8]>,
-        written: Vec<u8>,
-    }
-
-    impl Read for MockStream {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.response.read(buf)
-        }
-    }
-
-    impl Write for MockStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.written.write(buf)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
     }
 
     #[test]
-    fn host_header_omits_default_port() {
-        let mut stream = MockStream {
-            response: io::Cursor::new(b"HTTP/1.0 200 OK\r\n\r\n"),
-            written: Vec::new(),
-        };
-        let url = Url::parse("https://example.org/a?b=c#d").unwrap();
+    fn follows_redirects() {
+        let (port, server) = serve(|port| {
+            vec![
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: /second\r\nContent-Length: 0\r\n\r\n"
+                    .to_owned(),
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/third\r\n\r\nmoved"
+                ),
+                format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: //127.0.0.1:{port}/last\r\n\r\n"
+                ),
+                "HTTP/1.1 200 OK\r\n\r\narrived".to_owned(),
+            ]
+        });
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/first")).unwrap();
 
-        url.exchange(&mut stream).unwrap();
-        assert_eq!(
-            String::from_utf8(stream.written).unwrap(),
-            "GET /a?b=c HTTP/1.0\r\nHost: example.org\r\n\r\n"
-        );
+        assert_eq!(url.request().unwrap(), "arrived");
+        let paths: Vec<_> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|request| request.split(' ').nth(1).unwrap().to_owned())
+            .collect();
+        assert_eq!(paths, ["/first", "/second", "/third", "/last"]);
+    }
+
+    #[test]
+    fn shows_redirect_without_location_as_page() {
+        let (port, _server) = serve(|_| vec!["HTTP/1.1 302 Found\r\n\r\nno location".to_owned()]);
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        assert_eq!(url.request().unwrap(), "no location");
+    }
+
+    #[test]
+    fn gives_up_after_too_many_redirects() {
+        // 自分自身へのリダイレクトを繰り返すサーバー。上限を超えた回の移動先は
+        // 解釈できない形にして、解釈する前に打ち切っていることも確かめる
+        let (port, server) = serve(|_| {
+            let mut responses =
+                vec!["HTTP/1.1 302 Found\r\nLocation: /loop\r\n\r\n".to_owned(); MAX_REDIRECTS];
+            responses.push("HTTP/1.1 302 Found\r\nLocation: next.html\r\n\r\n".to_owned());
+            responses
+        });
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/loop")).unwrap();
+
+        assert!(matches!(url.request(), Err(RequestError::TooManyRedirects)));
+        // 最初の 1 回 + リダイレクト 20 回で打ち切っている
+        assert_eq!(server.join().unwrap().len(), MAX_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn reports_unsupported_redirect_target() {
+        let (port, _server) =
+            serve(|_| vec!["HTTP/1.1 301 Moved\r\nLocation: next.html\r\n\r\n".to_owned()]);
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/a/")).unwrap();
+
+        assert!(matches!(
+            url.request(),
+            Err(RequestError::InvalidRedirect {
+                location,
+                source: ParseError::RelativeUrl(_),
+            }) if location == "next.html"
+        ));
     }
 }
