@@ -39,3 +39,10 @@ depends = ["lint", "test"]
 [tasks.run]
 description = "ブラウザを起動する (例: mise run run -- https://example.org/)"
 run = "cargo run --release --"
+
+[tasks.mem]
+description = "URL を開いたときのピークメモリを測る (例: mise run mem -- https://example.org/)"
+run = [
+  "cargo build --release --locked",
+  "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/measure-memory.ps1",
+]

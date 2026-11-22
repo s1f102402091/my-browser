@@ -7,6 +7,7 @@ description = "「Web Browser Engineering」を参考に Rust で作る、省メ
 publish = false
 
 [dependencies]
+native-tls = "0.2"
 
 [lints.rust]
 unsafe_code = "deny"
