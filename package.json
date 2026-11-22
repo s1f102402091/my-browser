@@ -1,0 +1,9 @@
+{
+  "name": "my-browser-devtools",
+  "private": true,
+  "description": "commitlint 用の開発依存だけを管理する。ブラウザ本体は Cargo.toml を参照",
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.4",
+    "@commitlint/config-conventional": "^21.2.4"
+  }
+}

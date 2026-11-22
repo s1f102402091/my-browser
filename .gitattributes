@@ -1,0 +1,8 @@
+# Windows でも改行コードを LF に統一する (core.autocrlf の設定に左右されないように)
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.ttf binary
+*.otf binary

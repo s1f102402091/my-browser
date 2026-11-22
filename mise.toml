@@ -1,0 +1,41 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+# 開発ツールのバージョンをプロジェクト単位で固定する。
+# 初回セットアップ: `mise install` → `mise run setup`
+
+[tools]
+# Rust 本体。clippy / rustfmt / rust-src(rust-analyzer 用) を含める
+rust = { version = "1.100", profile = "minimal", components = "clippy,rustfmt,rust-src" }
+# commitlint を動かすためだけに使う
+node = "24"
+# Git フック管理
+lefthook = "2.2"
+# スペルチェッカ
+typos = "1.52"
+
+[tasks.setup]
+description = "初回セットアップ (npm 依存のインストールと Git フックの登録)"
+run = ["npm ci", "lefthook install"]
+
+[tasks.fmt]
+description = "コードを整形する"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "整形チェック・clippy・スペルチェック"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --all-targets --locked -- -D warnings",
+  "typos",
+]
+
+[tasks.test]
+description = "テストを実行する"
+run = "cargo test --all-targets --locked"
+
+[tasks.check]
+description = "コミット前に通すべき全チェック (lint + test)"
+depends = ["lint", "test"]
+
+[tasks.run]
+description = "ブラウザを起動する (例: mise run run -- https://example.org/)"
+run = "cargo run --release --"

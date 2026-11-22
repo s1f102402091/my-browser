@@ -1,0 +1,15 @@
+# Rust
+/target
+
+# Node (commitlint 用)
+node_modules/
+
+# エディタ・OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Claude Code の個人設定
+.claude/settings.local.json
