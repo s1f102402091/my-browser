@@ -28,6 +28,7 @@ mise run check    # 整形・lint・テストがすべて通ることを確認
 | `mise run lint` | 整形チェック・clippy・スペルチェック |
 | `mise run test` | テストを実行する |
 | `mise run check` | lint とテストをまとめて実行する |
+| `mise run mem -- <URL>` | URL を開いたときのピークメモリを測る (Windows) |
 
 ## Git フック (lefthook)
 
@@ -43,7 +44,7 @@ mise run check    # 整形・lint・テストがすべて通ることを確認
 
 ### Part 1: Loading Pages
 
-- [ ] 1. Downloading Web Pages
+- [x] 1. Downloading Web Pages ([練習問題 #1](https://github.com/s1f102402091/my-browser/issues/1))
 - [ ] 2. Drawing to the Screen
 - [ ] 3. Formatting Text
 
