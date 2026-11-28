@@ -30,6 +30,20 @@ mise run check    # 整形・lint・テストがすべて通ることを確認
 | `mise run check` | lint とテストをまとめて実行する |
 | `mise run mem -- <URL>` | URL を開いたときのピークメモリを測る (Windows) |
 
+## 開ける URL
+
+```powershell
+mise run run                                        # 既定のページ (assets/default.html)
+mise run run -- https://example.org/                # Web ページ (http / https)
+mise run run -- file:///C:/Users/me/page.html       # ローカルファイル
+mise run run -- "data:text/html,Hello%20world!"     # URL に埋め込んだ内容
+mise run run -- view-source:https://example.org/   # HTML のソースをそのまま表示
+```
+
+- mise は Windows で、空白を含む引数をうまく渡せません。URL の中の空白は `%20` と書いてください (`target\release\my-browser.exe` を直接起動するときは、空白のままでかまいません)。
+- data URL の中の `#` はフラグメントの始まりとみなされるので、`&#169;` のような数値の文字参照は `&%23169;` と書いてください (一般的なブラウザと同じ)。
+- 安全のため、ローカルファイルはコマンドラインで直接指定したときだけ開けます。リダイレクトでは開けません。ネットワーク上の共有フォルダ (`file://server/share/...`) も開けません。
+
 ## Git フック (lefthook)
 
 | タイミング | 実行内容 |
